@@ -1,4 +1,4 @@
-import 'dart:async' show Future, StreamController, scheduleMicrotask;
+import 'dart:async' show Future, StreamController, scheduleMicrotask, Completer, StreamSubscription;
 import 'dart:ui' as ui show Codec;
 
 import 'package:cached_network_image/src/image_provider/multi_image_stream_completer.dart';
@@ -11,8 +11,7 @@ import 'cached_network_image_provider.dart' as image_provider;
 
 /// IO implementation of the CachedNetworkImageProvider; the ImageProvider to
 /// load network images using a cache.
-class CachedNetworkImageProvider
-    extends ImageProvider<image_provider.CachedNetworkImageProvider>
+class CachedNetworkImageProvider extends ImageProvider<image_provider.CachedNetworkImageProvider>
     implements image_provider.CachedNetworkImageProvider {
   /// Creates an ImageProvider which loads an image from the [url], using the [scale].
   /// When the image fails to load [errorListener] is called.
@@ -59,15 +58,15 @@ class CachedNetworkImageProvider
   final int? maxWidth;
 
   @override
-  Future<CachedNetworkImageProvider> obtainKey(
-      ImageConfiguration configuration) {
+  Future<CachedNetworkImageProvider> obtainKey(ImageConfiguration configuration) {
     return SynchronousFuture<CachedNetworkImageProvider>(this);
   }
 
   @override
-  ImageStreamCompleter load(
-      image_provider.CachedNetworkImageProvider key, DecoderCallback decode) {
+  ImageStreamCompleter load(image_provider.CachedNetworkImageProvider key, DecoderCallback decode) {
     final chunkEvents = StreamController<ImageChunkEvent>();
+    // print('loading in CachedNetworkImageProvider for $key');
+
     return MultiImageStreamCompleter(
       codec: _loadAsync(key, chunkEvents, decode),
       chunkEvents: chunkEvents.stream,
@@ -80,6 +79,44 @@ class CachedNetworkImageProvider
         );
       },
     );
+  }
+
+  Future<FileInfo> _downloadImageFromStream(Map<String, dynamic> args) async {
+    StreamController<ImageChunkEvent> chunkEvents = args['chunkEvents'];
+    Stream<FileResponse> stream = args['stream'];
+    // DateTime start = new DateTime.now();
+    final Completer<FileInfo> finishedDownloadingCompleter = new Completer();
+    late final StreamSubscription<FileResponse> subscription;
+    subscription = stream.listen((result) {
+      if (result is DownloadProgress) {
+        chunkEvents.add(ImageChunkEvent(
+          cumulativeBytesLoaded: result.downloaded,
+          expectedTotalBytes: result.totalSize,
+        ));
+      }
+      if (result is FileInfo) {
+        // Duration dif = DateTime.now().difference(start);
+        // int seconds1 = dif.inSeconds;
+        // print('$seconds1 to start reading bytes for');
+        finishedDownloadingCompleter.complete(result);
+        subscription.cancel();
+      }
+    });
+    // await for (var result in stream) {
+    //   if (result is DownloadProgress) {
+    //     chunkEvents.add(ImageChunkEvent(
+    //       cumulativeBytesLoaded: result.downloaded,
+    //       expectedTotalBytes: result.totalSize,
+    //     ));
+    //   }
+    //   if (result is FileInfo) {
+    //     // Duration dif = DateTime.now().difference(start);
+    //     // int seconds1 = dif.inSeconds;
+    //     // print('$seconds1 to start reading bytes for');
+    //     return result;
+    //   }
+    // }
+    return finishedDownloadingCompleter.future;
   }
 
   Stream<ui.Codec> _loadAsync(
@@ -98,28 +135,47 @@ class CachedNetworkImageProvider
 
       var stream = mngr is ImageCacheManager
           ? mngr.getImageFile(key.url,
-              maxHeight: maxHeight,
-              maxWidth: maxWidth,
-              withProgress: true,
-              headers: headers,
-              key: key.cacheKey)
-          : mngr.getFileStream(key.url,
-              withProgress: true, headers: headers, key: key.cacheKey);
+              maxHeight: maxHeight, maxWidth: maxWidth, withProgress: true, headers: headers, key: key.cacheKey)
+          : mngr.getFileStream(key.url, withProgress: true, headers: headers, key: key.cacheKey);
 
-      await for (var result in stream) {
-        if (result is DownloadProgress) {
-          chunkEvents.add(ImageChunkEvent(
-            cumulativeBytesLoaded: result.downloaded,
-            expectedTotalBytes: result.totalSize,
-          ));
-        }
-        if (result is FileInfo) {
-          var file = result.file;
-          var bytes = await file.readAsBytes();
-          var decoded = await decode(bytes);
-          yield decoded;
-        }
-      }
+      // print('downloading image stream for $key');
+      Map<String, dynamic> args = new Map();
+      args['chunkEvents'] = chunkEvents;
+      args['stream'] = stream;
+      //dynamic result = await compute(_downloadImageFromStream, args);
+
+      //refactor into separate isolate to reduce jank on image loading
+      //spawning isolates is expensive so just use one to handle all pic loading tasks with following fxn
+      dynamic result = await _downloadImageFromStream(args);
+      var file = result.file;
+      var bytes = await file.readAsBytes();
+      var decoded = await decode(bytes);
+      yield decoded;
+      // DateTime start = new DateTime.now();
+      // await for (var result in stream) {
+      //   if (result is DownloadProgress) {
+      //     chunkEvents.add(ImageChunkEvent(
+      //       cumulativeBytesLoaded: result.downloaded,
+      //       expectedTotalBytes: result.totalSize,
+      //     ));
+      //   }
+      //   if (result is FileInfo) {
+      //     var file = result.file;
+      //     Duration duration1 = DateTime.now().difference(start);
+      //     int seconds1 = duration1.inSeconds;
+      //     print('$seconds1 to start reading bytes for $key');
+      //     var bytes = await file.readAsBytes();
+      //     Duration duration2 = DateTime.now().difference(start);
+      //     // int seconds2 = duration2.inSeconds;
+      //     // print('$seconds2 to read bytes for $key');
+      //     var decoded = await decode(bytes);
+      //     Duration duration3 = DateTime.now().difference(start);
+      //     // int seconds3 = duration3.inSeconds;
+      //     // print('$seconds3 to decode bytes for $key');
+      //     yield decoded;
+      //   }
+      // }
+      // print('downloaded image stream for $key');
     } catch (e) {
       // Depending on where the exception was thrown, the image cache may not
       // have had a chance to track the key in the cache at all.
@@ -129,7 +185,8 @@ class CachedNetworkImageProvider
       });
 
       errorListener?.call();
-      rethrow;
+      print('error in _loadAsync() in _image_provider_io.dart: ' + e.toString());
+      //rethrow;
     } finally {
       await chunkEvents.close();
     }
